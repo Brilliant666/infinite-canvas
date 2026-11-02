@@ -11,7 +11,7 @@ import { runModelPlugin } from "./model-plugin";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
 
-type VideoResponse = { id: string; status?: string; error?: { message?: string }; url?: string; result_url?: string; video_url?: string; content?: { video_url?: string; url?: string } | null };
+type VideoResponse = { id: string; status?: string; error?: string | { message?: string }; url?: string; result_url?: string; video_url?: string; content?: { video_url?: string; url?: string } | null; video?: { url?: string }; result?: { url?: string } };
 type ApiVideoResponse = VideoResponse | { code?: number | string; data?: VideoResponse | null; msg?: string; message?: string; error?: { message?: string } };
 type ApiEnvelope<T> = T | { code?: number | string; data?: T | null; msg?: string; message?: string; error?: { message?: string } };
 type RequestOptions = { signal?: AbortSignal };
@@ -57,6 +57,15 @@ export async function waitForVideoGenerationTask(config: AiConfig, task: VideoGe
         await delay(2500, options?.signal);
     }
     throw new Error(apiText("videoTimeout", { provider: "" }));
+}
+
+function isMuseVideoModel(model: string) {
+    return modelOptionName(model).toLowerCase().includes("muse");
+}
+
+function museVideoRatio(size: string) {
+    const dimensions = size.trim().match(/^(\d+)\s*[:x×]\s*(\d+)$/i);
+    return dimensions && Number(dimensions[2]) > Number(dimensions[1]) ? "9:16" : "16:9";
 }
 
 export function isVideoTaskFailed(error: unknown) {
@@ -147,6 +156,17 @@ export async function storeGeneratedVideo(result: VideoGenerationResult): Promis
 }
 
 async function createOpenAIVideoTask(config: AiConfig, model: string, prompt: string, references: ReferenceImage[], options?: VideoMediaOptions): Promise<VideoGenerationTask> {
+    if (isMuseVideoModel(model)) {
+        if (options?.videos?.length || options?.audios?.length) throw new Error("Muse 视频仅支持参考图片。");
+        if (references.length > 4) throw new Error("Muse 视频最多支持 4 张参考图片。");
+        const images = await Promise.all(references.map((image) => imageToDataUrl(image, options)));
+        if (images.some((image) => !image.startsWith("data:image/"))) throw new Error("无法读取 Muse 视频参考图片。");
+        return submitOpenAIVideoTask(config, model, {
+            model: modelOptionName(model), prompt, duration: Number(normalizeVideoSeconds(config.videoSeconds)),
+            size: normalizeVideoSize(config.size, config.vquality) || "1280x720",
+            aspect_ratio: museVideoRatio(config.size), resolution: normalizeVideoResolution(config.vquality), images,
+        }, options);
+    }
     const images = await Promise.all(references.map(async (image) => dataUrlToFile({ ...image, dataUrl: await imageToDataUrl(image) })));
     const videos = await Promise.all((options?.videos || []).map((video) => referenceMediaToFile(video, "ref.mp4", "invalidReferenceVideo", options)));
     const audios = await Promise.all((options?.audios || []).map((audio) => referenceMediaToFile(audio, "ref.mp3", "invalidReferenceAudio", options)));
@@ -181,6 +201,10 @@ async function createOpenAIVideoTask(config: AiConfig, model: string, prompt: st
     }
     videos.forEach((file) => body.append("video[]", file));
     audios.forEach((file) => body.append("audio[]", file));
+    return submitOpenAIVideoTask(config, model, body, options);
+}
+
+async function submitOpenAIVideoTask(config: AiConfig, model: string, body: FormData | Record<string, unknown>, options?: RequestOptions): Promise<VideoGenerationTask> {
     try {
         const created = unwrapVideoResponse((await axios.post<ApiVideoResponse>(aiApiUrl(config, "/videos"), body, { headers: aiHeaders(config), signal: options?.signal })).data);
         if (!created.id) throw new Error(apiText("noVideoTaskId"));
@@ -193,6 +217,22 @@ async function createOpenAIVideoTask(config: AiConfig, model: string, prompt: st
 async function pollOpenAIVideoTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationTaskState> {
     try {
         const video = unwrapVideoResponse((await axios.get<ApiVideoResponse>(aiApiUrl(config, `/videos/${task.id}`), { headers: aiHeaders(config), signal: options?.signal })).data);
+        if (isMuseVideoModel(task.model)) {
+            if (video.status === "failed" || video.status === "cancelled") return { status: "failed", error: readApiErrorMessage(video.error) || apiText("videoGenerationFailed") };
+            if (video.status !== "completed") return { status: "pending" };
+            const value = video.url || video.result?.url || video.video?.url;
+            if (!value) throw new Error(apiText("noPlayableVideo"));
+            const media = new URL(value, config.baseUrl);
+            const base = new URL(config.baseUrl);
+            if (media.origin !== base.origin || media.username || media.password || !/^\/v1\/media\/[^/]+$/.test(media.pathname)) {
+                throw new Error("Muse 返回的视频地址不属于当前渠道的媒体接口。");
+            }
+            const download = await axios.get<Blob>(withLocalProxy(media.href), {
+                headers: aiHeaders(config), responseType: "blob", signal: options?.signal,
+            });
+            if (!download.data.size || !/^(video\/|application\/octet-stream)/i.test(download.data.type)) throw new Error(apiText("videoDownloadFailed"));
+            return { status: "completed", result: { blob: download.data } };
+        }
         const url = videoResultUrl(video);
         if (url) return { status: "completed", result: await videoResultFromUrl(url, options) };
         if (video.status === "completed") {
@@ -200,7 +240,7 @@ async function pollOpenAIVideoTask(config: AiConfig, task: VideoGenerationTask, 
             await assertVideoBlob(content.data);
             return { status: "completed", result: { blob: content.data } };
         }
-        if (video.status === "failed" || video.status === "cancelled") return { status: "failed", error: readApiErrorMessage(video.error?.message) || apiText("videoGenerationFailed") };
+        if (video.status === "failed" || video.status === "cancelled") return { status: "failed", error: readApiErrorMessage(typeof video.error === "object" ? video.error.message : undefined) || apiText("videoGenerationFailed") };
         return { status: "pending" };
     } catch (error) {
         throw new Error(readAxiosError(error, apiText("videoTaskQueryFailed")));

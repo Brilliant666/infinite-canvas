@@ -806,7 +806,9 @@ export async function requestEdit(config: AiConfig, prompt: string, references: 
         formData.set("background", background);
     }
     const files = await Promise.all(references.map(async (image) => dataUrlToFile({ ...image, dataUrl: await imageToDataUrl(image) })));
-    const imageField = files.length > 1 ? "image[]" : "image";
+    // Muse2API reads repeated "image" parts; keep other OpenAI-compatible providers unchanged.
+    const museEdit = requestConfig.model === "muse-image" && requestConfig.baseUrl.trim().toLowerCase().split("/")[2] === "museapi.dokitool.com";
+    const imageField = files.length > 1 && !museEdit ? "image[]" : "image";
     files.forEach((file) => formData.append(imageField, file));
 
     try {

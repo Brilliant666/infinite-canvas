@@ -259,6 +259,8 @@ async function generateImage({
   apiKey,
   request,
 }) {
+  const museEdit = model === "muse-image" && baseUrl.trim().toLowerCase().split("/")[2] === "museapi.dokitool.com";
+  if (museEdit) baseUrl = "https://museapi.dokitool.com";
   if (images.length === 0) {
     const data = await request({
       method: "post",
@@ -292,7 +294,7 @@ async function generateImage({
   form.set("quality", quality);
   form.set("background", background);
   form.set("response_format", "b64_json");
-  const imageField = images.length > 1 ? "image[]" : "image";
+  const imageField = images.length > 1 && !museEdit ? "image[]" : "image";
   for (const dataUrl of images) {
     form.append(imageField, await (await fetch(dataUrl)).blob(), "ref.png");
   }
