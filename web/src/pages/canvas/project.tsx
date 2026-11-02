@@ -45,6 +45,7 @@ import { CanvasZoomControls } from "@/components/canvas/canvas-zoom-controls";
 import { useAgentStore } from "@/stores/use-agent-store";
 import { useCanvasStore } from "@/stores/canvas/use-canvas-store";
 import { useAgentBridge } from "@/pages/canvas/hooks/use-agent-bridge";
+import { canvasMuseTasks, detachCanvasMuseTasks, useCanvasMuseTasks } from "@/pages/canvas/hooks/use-canvas-muse-tasks";
 import { usePluginHost } from "@/pages/canvas/hooks/use-plugin-host";
 import { buildNodeMentionReferences, getGroupResourceNodes, isCanvasReferenceNode, type CanvasResourceReference } from "@/lib/canvas/canvas-resource-references";
 import { exportCanvasProjects } from "@/lib/canvas/canvas-export";
@@ -144,6 +145,7 @@ function applyGeneratedVideo(item: CanvasNodeData, video: UploadedFile, extra: C
 }
 
 export default function CanvasPage() {
+    const { id } = useParams<{ id: string }>();
     const [mounted, setMounted] = useState(false);
 
     useEffect(() => {
@@ -152,7 +154,7 @@ export default function CanvasPage() {
 
     if (!mounted) return <CanvasRefreshShell />;
 
-    return <InfiniteCanvasPage />;
+    return <InfiniteCanvasPage key={id} />;
 }
 
 function measureFocusFrame(container: HTMLDivElement | null, nodeId: string) {
@@ -404,6 +406,12 @@ function InfiniteCanvasPage() {
             affectedNodeIds.add(request.originNodeId);
         });
         setRunningNodeId((current) => (current === runningId ? null : current));
+        for (const node of nodesRef.current) {
+            if (node.metadata?.museImageTasks?.some((task) => task.originId === runningId || node.id === runningId)) {
+                affectedNodeIds.add(node.id);
+                affectedNodeIds.add(runningId);
+            }
+        }
         if (!affectedNodeIds.size) return;
         setNodes((prev) =>
             prev.map((node) =>
@@ -414,6 +422,7 @@ function InfiniteCanvasPage() {
                               ...node.metadata,
                               status: NODE_STATUS_IDLE,
                               errorDetails: undefined,
+                              museImageTasks: undefined,
                               images: node.metadata.images?.map((image) => (image.status === NODE_STATUS_LOADING ? { ...image, status: NODE_STATUS_ERROR, errorDetails: t("common.requestCanceled") } : image)),
                               texts: node.metadata.texts?.map((text) => (text.status === NODE_STATUS_LOADING ? { ...text, status: NODE_STATUS_ERROR, errorDetails: t("common.requestCanceled") } : text)),
                           },
@@ -525,6 +534,8 @@ function InfiniteCanvasPage() {
         if (!projectLoaded || historyPausedRef.current) return;
         updateProject(projectId, { nodes, connections, chatSessions, activeChatId, backgroundMode, showImageInfo });
     }, [activeChatId, backgroundMode, chatSessions, connections, nodes, projectId, projectLoaded, showImageInfo, updateProject]);
+
+    useCanvasMuseTasks(projectId, projectLoaded, nodes, effectiveConfig, setNodes, message.error);
 
     useEffect(() => {
         if (!dialogNodeId) setNodeImageSettingsOpen(false);
@@ -704,6 +715,9 @@ function InfiniteCanvasPage() {
         [nodes, viewBounds],
     );
 
+    const runningMuseNodes = useMemo(() => new Set(nodes.flatMap((node) =>
+        node.metadata?.museImageTasks?.filter((task) => !task.paused).flatMap((task) => [node.id, task.originId]) || [],
+    )), [nodes]);
     const nodeById = useMemo(() => new Map(nodes.map((node) => [node.id, node])), [nodes]);
 
     // Connections are culled like nodes; a cubic curve stays inside its control-point hull, so endpoint bounds widened by the curvature is a safe test.
@@ -996,7 +1010,7 @@ function InfiniteCanvasPage() {
 
         const id = `${source.type}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
         const next: CanvasNodeData = {
-            ...source,
+            ...detachCanvasMuseTasks(source),
             id,
             title: `${source.title} Copy`,
             position: { x: source.position.x + 36, y: source.position.y + 36 },
@@ -1019,7 +1033,7 @@ function InfiniteCanvasPage() {
             .map((node) => ({
                 ...node,
                 position: { ...node.position },
-                metadata: node.metadata ? { ...node.metadata } : undefined,
+                metadata: detachCanvasMuseTasks(node).metadata,
             }));
 
         if (!copiedNodes.length) return;
@@ -2009,7 +2023,8 @@ function InfiniteCanvasPage() {
             const maskSource = { id: maskNodeId, name: "mask.png", type: maskImage.mimeType || "image/png", dataUrl: maskImage.url, storageKey: maskImage.storageKey };
             const references = [source, maskSource];
             const generationMetadata = buildImageGenerationMetadata("edit", generationConfig, 1, references);
-            const childMetadata = payload.generate ? { prompt, status: NODE_STATUS_LOADING, ...generationMetadata } : { prompt };
+            const museImageTasks = payload.generate ? canvasMuseTasks(generationConfig, prompt, references, childId) : undefined;
+            const childMetadata = payload.generate ? { prompt, status: NODE_STATUS_LOADING, ...generationMetadata, museImageTasks } : { prompt };
             setNodes((prev) => [
                 ...prev,
                 {
@@ -2039,7 +2054,7 @@ function InfiniteCanvasPage() {
             setSelectedNodeIds(new Set([childId]));
             setSelectedConnectionId(null);
             setDialogNodeId(childId);
-            if (!payload.generate) return;
+            if (!payload.generate || museImageTasks) return;
             setRunningNodeId(childId);
             const controller = startGenerationRequest(childId, node.id, childId);
             try {
@@ -2097,11 +2112,11 @@ function InfiniteCanvasPage() {
             const imageConfig = NODE_DEFAULT_SIZE[CanvasNodeType.Image];
             const title = buildAngleLabel(params);
             const prompt = buildAnglePrompt(params);
-            const generationMetadata = buildImageGenerationMetadata("edit", generationConfig, 1, [
-                { id: node.id, name: `${node.title || node.id}.png`, type: node.metadata.mimeType || "image/png", dataUrl: node.metadata.content, storageKey: node.metadata.storageKey },
-            ]);
+            const references = [{ id: node.id, name: `${node.title || node.id}.png`, type: node.metadata.mimeType || "image/png", dataUrl: node.metadata.content, storageKey: node.metadata.storageKey }];
+            const generationMetadata = buildImageGenerationMetadata("edit", generationConfig, 1, references);
+            const museImageTasks = canvasMuseTasks(generationConfig, prompt, references, childId);
             setAngleNodeId(null);
-            setRunningNodeId(childId);
+            if (!museImageTasks) setRunningNodeId(childId);
             setNodes((prev) => [
                 ...prev,
                 {
@@ -2111,18 +2126,19 @@ function InfiniteCanvasPage() {
                     position: { x: node.position.x + node.width + 96, y: node.position.y },
                     width: imageConfig.width,
                     height: imageConfig.height,
-                    metadata: { prompt, status: NODE_STATUS_LOADING, ...generationMetadata },
+                    metadata: { prompt, status: NODE_STATUS_LOADING, ...generationMetadata, museImageTasks },
                 },
             ]);
             setConnections((prev) => [...prev, { id: nanoid(), fromNodeId: node.id, toNodeId: childId }]);
             setSelectedNodeIds(new Set([childId]));
             setDialogNodeId(childId);
+            if (museImageTasks) return;
             const controller = startGenerationRequest(childId, node.id, childId);
             try {
                 const image = await requestEdit(
                     generationConfig,
                     prompt,
-                    [{ id: node.id, name: `${node.title || node.id}.png`, type: node.metadata.mimeType || "image/png", dataUrl: node.metadata.content, storageKey: node.metadata.storageKey }],
+                    references,
                     { signal: controller.signal },
                 ).then((items) => items[0]);
                 const uploaded = await uploadImage(image.dataUrl, { signal: controller.signal });
@@ -2345,6 +2361,13 @@ function InfiniteCanvasPage() {
                     const fullPrompt = (builtinPanel.promptPrefix || "") + scene;
                     const context = await hydrateNodeGenerationContext(buildNodeGenerationContext(nodeId, nodesRef.current, connectionsRef.current, fullPrompt));
                     const refs = context.referenceImages;
+                    const museImageTasks = canvasMuseTasks(generationConfig, context.prompt, refs, nodeId);
+                    if (museImageTasks) {
+                        setNodes((prev) => prev.map((n) => n.id === nodeId ? { ...n, metadata: { ...n.metadata, museImageTasks } } : n));
+                        setDialogNodeId(null);
+                        setRunningNodeId(null);
+                        return;
+                    }
                     const image = refs.length
                         ? await requestEdit({ ...generationConfig, count: "1" }, context.prompt, refs, { signal: controller.signal }).then((items) => items[0])
                         : await requestGeneration({ ...generationConfig, count: "1" }, context.prompt, { signal: controller.signal }).then((items) => items[0]);
@@ -2408,6 +2431,7 @@ function InfiniteCanvasPage() {
                     const rootId = reuseImageNode ? nodeId : nanoid();
                     const imageIds = Array.from({ length: count }, () => nanoid());
                     pendingChildIds = [rootId];
+                    const museImageTasks = canvasMuseTasks(generationConfig, effectivePrompt, referenceImages, nodeId, imageIds);
                     const rootNode: CanvasNodeData = {
                         id: rootId,
                         type: CanvasNodeType.Image,
@@ -2421,6 +2445,7 @@ function InfiniteCanvasPage() {
                         metadata: {
                             prompt: effectivePrompt,
                             status: NODE_STATUS_LOADING,
+                            museImageTasks,
                             images: imageIds.map((id) => ({ id, status: NODE_STATUS_LOADING, content: "", naturalWidth: 0, naturalHeight: 0, bytes: 0, mimeType: "" })),
                             primaryImageId: undefined,
                             ...generationMetadata,
@@ -2466,6 +2491,7 @@ function InfiniteCanvasPage() {
                     setSelectedConnectionId(null);
                     setDialogNodeId(nodeId);
 
+                    if (museImageTasks) return;
                     const controller = rootId === nodeId ? runController : startGenerationRequest(rootId, nodeId, nodeId, runController);
                     let hasSuccess = false;
                     let hasFailure = false;
@@ -2767,6 +2793,15 @@ function InfiniteCanvasPage() {
 
     const handleRetryNode = useCallback(
         async (node: CanvasNodeData, imageId?: string) => {
+            const unfinished = node.metadata?.museImageTasks?.filter((task) => !imageId || task.slotId === imageId);
+            if (unfinished?.length) {
+                const keys = new Set(unfinished.map((task) => task.key));
+                setNodes((prev) => prev.map((n) => n.id === node.id ? { ...n, metadata: { ...n.metadata, status: NODE_STATUS_LOADING, errorDetails: undefined,
+                    museImageTasks: n.metadata?.museImageTasks?.map((task) => keys.has(task.key) ? { ...task, paused: false } : task),
+                    images: n.metadata?.images?.map((slot) => unfinished.some((task) => task.slotId === slot.id) ? { ...slot, status: NODE_STATUS_LOADING, errorDetails: undefined } : slot),
+                } } : n));
+                return;
+            }
             if (hasResumableVideoTask(node)) {
                 await pollVideoNodeTask(node);
                 return;
@@ -2844,6 +2879,13 @@ function InfiniteCanvasPage() {
                     return;
                 }
 
+                const museImageTasks = canvasMuseTasks(generationConfig, prompt, useReferenceImages ? retryImages : [], node.id, [imageId]);
+                if (museImageTasks) {
+                    setNodes((prev) => prev.map((n) => n.id === node.id ? { ...n, metadata: { ...n.metadata,
+                        museImageTasks: [...(n.metadata?.museImageTasks || []).filter((task) => task.slotId !== imageId), ...museImageTasks],
+                    } } : n));
+                    return;
+                }
                 const image = useReferenceImages
                     ? await requestEdit(generationConfig, prompt, retryImages, { signal: controller.signal }).then((items) => items[0])
                     : await requestGeneration(generationConfig, prompt, { signal: controller.signal }).then((items) => items[0]);
@@ -2926,7 +2968,8 @@ function InfiniteCanvasPage() {
             prev.map((item) => {
                 if (item.id !== nodeId) return item;
                 const images = item.metadata?.images?.filter((image) => image.id !== imageId) || [];
-                return { ...item, metadata: { ...item.metadata, images, count: images.length, primaryImageId: item.metadata?.primaryImageId === imageId ? images[0]?.id : item.metadata?.primaryImageId } };
+                const museImageTasks = item.metadata?.museImageTasks?.filter((task) => task.slotId !== imageId);
+                return { ...item, metadata: { ...item.metadata, images, museImageTasks, count: images.length, primaryImageId: item.metadata?.primaryImageId === imageId ? images[0]?.id : item.metadata?.primaryImageId } };
             }),
         );
     }, []);
@@ -3094,7 +3137,7 @@ function InfiniteCanvasPage() {
                 <CanvasNodePromptPanel
                     node={panelNode}
                     nodes={nodes}
-                    isRunning={runningNodeId === panelNode.id}
+                    isRunning={runningNodeId === panelNode.id || runningMuseNodes.has(panelNode.id)}
                     mentionReferences={mentionReferencesByNodeId.get(panelNode.id) || EMPTY_REFERENCES}
                     connectedNodes={connectedNodesByNodeId.get(panelNode.id) || []}
                     onPromptChange={handleNodePromptChange}
@@ -3110,14 +3153,14 @@ function InfiniteCanvasPage() {
                     }}
                 />
             ),
-        [configInputsById, confirmStopGeneration, connectedNodesByNodeId, disconnectNodeReference, handleConfigNodeChange, handleGenerateNode, handleNodePromptChange, mentionReferencesByNodeId, nodes, renderPluginPanel, runningNodeId, startNodeReferenceSelection],
+        [configInputsById, confirmStopGeneration, connectedNodesByNodeId, disconnectNodeReference, handleConfigNodeChange, handleGenerateNode, handleNodePromptChange, mentionReferencesByNodeId, nodes, renderPluginPanel, runningMuseNodes, runningNodeId, startNodeReferenceSelection],
     );
 
     const renderNodeContentPanel = useCallback(
         (contentNode: CanvasNodeData) => (
             <CanvasConfigNodePanel
                 node={contentNode}
-                isRunning={runningNodeId === contentNode.id}
+                isRunning={runningNodeId === contentNode.id || runningMuseNodes.has(contentNode.id)}
                 inputSummary={getInputSummary(configInputsById.get(contentNode.id) || [])}
                 onConfigChange={handleConfigNodeChange}
                 onComposerToggle={() => setDialogNodeId((current) => (current === contentNode.id ? null : contentNode.id))}
@@ -3128,7 +3171,7 @@ function InfiniteCanvasPage() {
                 }}
             />
         ),
-        [configInputsById, confirmStopGeneration, handleConfigNodeChange, handleGenerateNode, runningNodeId],
+        [configInputsById, confirmStopGeneration, handleConfigNodeChange, handleGenerateNode, runningMuseNodes, runningNodeId],
     );
 
     const hoverPreviewNode = hoverPreviewNodeId ? nodeById.get(hoverPreviewNodeId) || null : null;

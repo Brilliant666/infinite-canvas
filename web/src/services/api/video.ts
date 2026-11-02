@@ -6,7 +6,7 @@ import { dataUrlToFile, readFileAsDataUrl } from "@/lib/image-utils";
 import { clampVideoSeconds, computeVideoSize, inferVideoRatio } from "@/lib/media-size";
 import { getMediaBlob, resolveMediaUrl, uploadMediaFile, type UploadedFile } from "@/services/file-storage";
 import { imageToDataUrl } from "@/services/image-storage";
-import { boolConfig, buildApiUrl, modelOptionName, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
+import { boolConfig, buildApiUrl, decodeChannelModel, encodeChannelModel, modelOptionName, resolveModelChannel, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig } from "@/stores/use-config-store";
 import { runModelPlugin } from "./model-plugin";
 import type { ReferenceImage } from "@/types/image";
 import type { ReferenceAudio, ReferenceVideo } from "@/types/media";
@@ -19,7 +19,7 @@ type VideoMediaOptions = RequestOptions & { videos?: ReferenceVideo[]; audios?: 
 const apiText = (key: string, options?: Record<string, unknown>) => i18n.t(`apiErrors.${key}`, options);
 
 export type VideoGenerationResult = { blob?: Blob; url?: string; mimeType?: string };
-export type VideoGenerationTask = { id: string; provider: "openai" | "gemini" | "plugin"; model: string };
+export type VideoGenerationTask = { id: string; provider: "openai" | "gemini" | "plugin"; model: string; endpoint?: string };
 type GeminiInlineData = { bytesBase64Encoded: string; mimeType: string };
 type GeminiVideoOperation = {
     name?: string;
@@ -63,6 +63,15 @@ function isMuseVideoModel(model: string) {
     return modelOptionName(model).toLowerCase().includes("muse");
 }
 
+export function isMuseVideoTask(task?: VideoGenerationTask) {
+    return task?.provider === "openai" && isMuseVideoModel(task.model);
+}
+
+function museEndpoint(baseUrl: string) {
+    const url = new URL(baseUrl);
+    return url.origin + url.pathname.replace(/\/+$/, "").replace(/\/v1$/, "");
+}
+
 function museVideoRatio(size: string) {
     const dimensions = size.trim().match(/^(\d+)\s*[:x×]\s*(\d+)$/i);
     return dimensions && Number(dimensions[2]) > Number(dimensions[1]) ? "9:16" : "16:9";
@@ -94,6 +103,13 @@ export async function pollVideoGenerationTask(config: AiConfig, task: VideoGener
         return result ? { status: "completed", result } : { status: "failed", error: apiText("pluginVideoExpired") };
     }
     const requestConfig = resolveModelRequestConfig(config, task.model);
+    if (isMuseVideoTask(task)) {
+        const channelId = decodeChannelModel(task.model)?.channelId;
+        if ((channelId && !config.channels.some((channel) => channel.id === channelId)) ||
+            requestConfig.apiFormat === "gemini" || (task.endpoint && museEndpoint(requestConfig.baseUrl) !== task.endpoint)) {
+            throw new Error(i18n.t("videoWorkbench.taskChannelChanged"));
+        }
+    }
     assertVideoConfig(requestConfig, requestConfig.model);
     if (task.provider === "gemini") return pollGeminiVideoTask(requestConfig, task, options);
     return pollOpenAIVideoTask(requestConfig, task, options);
@@ -161,11 +177,14 @@ async function createOpenAIVideoTask(config: AiConfig, model: string, prompt: st
         if (references.length > 4) throw new Error("Muse 视频最多支持 4 张参考图片。");
         const images = await Promise.all(references.map((image) => imageToDataUrl(image, options)));
         if (images.some((image) => !image.startsWith("data:image/"))) throw new Error("无法读取 Muse 视频参考图片。");
-        return submitOpenAIVideoTask(config, model, {
+        const channel = resolveModelChannel(config, model);
+        const endpoint = museEndpoint(config.baseUrl);
+        const task = await submitOpenAIVideoTask(config, encodeChannelModel(channel.id, modelOptionName(model)), {
             model: modelOptionName(model), prompt, duration: Number(normalizeVideoSeconds(config.videoSeconds)),
             size: normalizeVideoSize(config.size, config.vquality) || "1280x720",
             aspect_ratio: museVideoRatio(config.size), resolution: normalizeVideoResolution(config.vquality), images,
         }, options);
+        return { ...task, endpoint };
     }
     const images = await Promise.all(references.map(async (image) => dataUrlToFile({ ...image, dataUrl: await imageToDataUrl(image) })));
     const videos = await Promise.all((options?.videos || []).map((video) => referenceMediaToFile(video, "ref.mp4", "invalidReferenceVideo", options)));
@@ -215,11 +234,14 @@ async function submitOpenAIVideoTask(config: AiConfig, model: string, body: Form
 }
 
 async function pollOpenAIVideoTask(config: AiConfig, task: VideoGenerationTask, options?: RequestOptions): Promise<VideoGenerationTaskState> {
+    let phase = "videoTaskQueryFailed";
     try {
-        const video = unwrapVideoResponse((await axios.get<ApiVideoResponse>(aiApiUrl(config, `/videos/${task.id}`), { headers: aiHeaders(config), signal: options?.signal })).data);
+        const video = unwrapVideoResponse((await axios.get<ApiVideoResponse>(aiApiUrl(config, `/videos/${encodeURIComponent(task.id)}`), { headers: aiHeaders(config), signal: options?.signal })).data);
         if (isMuseVideoModel(task.model)) {
+            if (video.id && video.id !== task.id) throw new Error(i18n.t("videoWorkbench.taskMismatch"));
             if (video.status === "failed" || video.status === "cancelled") return { status: "failed", error: readApiErrorMessage(video.error) || apiText("videoGenerationFailed") };
             if (video.status !== "completed") return { status: "pending" };
+            phase = "videoDownloadFailed";
             const value = video.url || video.result?.url || video.video?.url;
             if (!value) throw new Error(apiText("noPlayableVideo"));
             const media = new URL(value, config.baseUrl);
@@ -243,7 +265,9 @@ async function pollOpenAIVideoTask(config: AiConfig, task: VideoGenerationTask, 
         if (video.status === "failed" || video.status === "cancelled") return { status: "failed", error: readApiErrorMessage(typeof video.error === "object" ? video.error.message : undefined) || apiText("videoGenerationFailed") };
         return { status: "pending" };
     } catch (error) {
-        throw new Error(readAxiosError(error, apiText("videoTaskQueryFailed")));
+        const label = apiText(phase);
+        const detail = readAxiosError(error, label);
+        throw new Error(isMuseVideoTask(task) && detail !== label ? `${label} · ${detail}` : detail);
     }
 }
 

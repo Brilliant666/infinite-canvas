@@ -7,6 +7,9 @@ description: Implemented changes that still need manual verification
 
 The current release needs manual verification in these areas:
 
+- Muse images: Image Studio recovered one live image into the original record after refresh both before and after saving the task ID. The replay returned the same task ID. A two-image canvas batch also recovered in a browser with a simulated Muse endpoint (two generated images, two submissions). Verify reference images, mixed batch outcomes and a changed provider configuration.
+- Muse video history: querying an existing interrupted task recovered the live MP4 and it remained playable after refresh. Verify that a confirmed upstream failure remains visible.
+
 - Muse video: verify text-only and reference-image requests, queued task recovery and saving the authenticated video download from the configured Muse endpoint. Muse image edits on this endpoint send each reference as a separate image part.
 
 - Saved model selection: save a canvas node with a model, then remove its provider or remove that model while another video model remains the default. Generation, retry and pending-video recovery should keep the unavailable model selected and open configuration instead of sending a request to the default or first provider. Re-selecting a valid model should allow generation. Changing only the API key on the same provider should preserve the model; switching a config node from a valid image model to video should still use the video default.

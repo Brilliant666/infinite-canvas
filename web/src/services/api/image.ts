@@ -1,10 +1,10 @@
 import axios from "axios";
 
 import i18n from "@/i18n";
-import { buildApiUrl, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
-import { normalizePluginImages, runModelPlugin } from "./model-plugin";
+import { buildApiUrl, encodeChannelModel, modelCapabilityOf, modelOptionName, resolveModelChannel, resolveModelRequestConfig, resolveModelScript, withLocalProxy, type AiConfig, type ModelChannel } from "@/stores/use-config-store";
+import { normalizePluginImages, runModelPlugin, sleep } from "./model-plugin";
 import { nanoid } from "nanoid";
-import { dataUrlToFile } from "@/lib/image-utils";
+import { dataUrlToFile, readFileAsDataUrl } from "@/lib/image-utils";
 import { buildImageReferencePromptText } from "@/lib/image-reference-prompt";
 import { imageToDataUrl } from "@/services/image-storage";
 import { imageSizePresets, inferMediaScale } from "@/lib/media-size";
@@ -689,6 +689,102 @@ function parseGeminiImagePayload(payload: GeminiPayload) {
             .map((dataUrl) => ({ id: nanoid(), dataUrl })) || [];
     if (!images.length) throw new Error(apiText("geminiNoImage"));
     return images;
+}
+
+export type MuseImageTaskSource = { channelId: string; baseUrl: string; model: string; language: string };
+type MuseImageTaskResponse = { id?: string; task_id?: string; status?: string; error?: unknown; url?: string; data?: Array<{ url?: string; b64_json?: string }> };
+type MuseImageTaskState = { status: "pending" } | { status: "failed"; error: string } | { status: "completed"; image: { id: string; dataUrl: string } };
+export class MuseImageTaskRejectedError extends Error {}
+
+export function getMuseImageTaskSource(config: AiConfig): MuseImageTaskSource | null {
+    const selected = config.model || config.imageModel;
+    if (modelOptionName(selected) !== "muse-image" || modelCapabilityOf(config, selected) !== "image" || resolveModelScript(config, selected)) return null;
+    const channel = resolveModelChannel(config, selected);
+    if (channel.apiFormat !== "openai" || !URL.canParse(channel.baseUrl)) return null;
+    const url = new URL(channel.baseUrl);
+    if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash) return null;
+    return { channelId: channel.id, baseUrl: url.href.replace(/\/+$/, ""), model: encodeChannelModel(channel.id, "muse-image"), language: i18n.resolvedLanguage || i18n.language };
+}
+
+function museTaskConfig(config: AiConfig, source: MuseImageTaskSource) {
+    const current = getMuseImageTaskSource({ ...config, model: source.model });
+    if (!current || current.channelId !== source.channelId || current.baseUrl !== source.baseUrl || current.model !== source.model) {
+        throw new Error("原 Muse 生图渠道已移除或变更，请恢复原渠道后继续查询。");
+    }
+    const resolved = resolveModelRequestConfig(config, source.model);
+    if (!resolved.apiKey.trim()) throw new Error(apiText("apiKeyRequired"));
+    return resolved;
+}
+
+export async function submitMuseImageTask(config: AiConfig, source: MuseImageTaskSource, prompt: string, references: ReferenceImage[], idempotencyKey: string, options?: RequestOptions): Promise<string> {
+    const requestConfig = museTaskConfig(config, source);
+    if (!idempotencyKey.trim()) throw new MuseImageTaskRejectedError("Muse 生图任务缺少幂等键。");
+    let size;
+    try {
+        size = resolveRequestSize(config.size);
+    } catch (error) {
+        throw new MuseImageTaskRejectedError(readAxiosError(error, apiText("invalidImageSizeFormat")));
+    }
+    const quality = normalizeQuality(config.quality);
+    const background = normalizeBackground(config.background);
+    const images = await Promise.all(references.map((ref) => imageToDataUrl(ref, options)));
+    if (images.some((ref) => !ref.startsWith("data:image/"))) throw new MuseImageTaskRejectedError("Muse 参考图片不可用。");
+    try {
+        const { data } = await axios.post<MuseImageTaskResponse>(aiApiUrl(requestConfig, "/images/tasks"), {
+            model: requestConfig.model, prompt: withSystemPrompt(requestConfig, buildImageReferencePromptText(prompt, references, source.language)),
+            n: 1, size, ...(quality ? { quality } : {}), ...(background ? { background } : {}), response_format: "url", images,
+        }, { headers: { ...aiHeaders(requestConfig, "application/json"), "Idempotency-Key": idempotencyKey }, signal: options?.signal, timeout: IMAGE_REQUEST_TIMEOUT_MS });
+        const id = data.id || data.task_id;
+        if (typeof id !== "string" || !id.trim()) throw new Error("Muse 未返回生图任务 ID。");
+        return id;
+    } catch (error) {
+        const message = readAxiosError(error, apiText("requestFailed"));
+        const status = axios.isAxiosError(error) ? error.response?.status : undefined;
+        if (status === 400 || status === 409 || status === 413 || status === 422) throw new MuseImageTaskRejectedError(message);
+        throw new Error(message);
+    }
+}
+
+export async function pollMuseImageTask(config: AiConfig, source: MuseImageTaskSource, taskId: string, options?: RequestOptions): Promise<MuseImageTaskState> {
+    const requestConfig = museTaskConfig(config, source);
+    const request = { headers: aiHeaders(requestConfig), signal: options?.signal, timeout: IMAGE_REQUEST_TIMEOUT_MS };
+    const { data } = await axios.get<MuseImageTaskResponse>(aiApiUrl(requestConfig, `/images/tasks/${encodeURIComponent(taskId)}`), request);
+    if (data.id !== taskId) throw new Error("Muse 返回的图片任务与当前记录不一致。");
+    if (data.status === "failed" || data.status === "cancelled") return { status: "failed", error: readApiErrorMessage(data.error) || "Muse 生图失败。" };
+    if (data.status === "queued" || data.status === "processing") return { status: "pending" };
+    if (data.status !== "completed") throw new Error("Muse 返回了未知的图片任务状态。");
+    const item = data.data?.[0];
+    if (item?.b64_json) return { status: "completed", image: { id: taskId, dataUrl: `data:image/png;base64,${item.b64_json}` } };
+    const value = item?.url || data.url;
+    if (!value) throw new Error(apiText("noImageReturned"));
+    const media = new URL(value, source.baseUrl);
+    if (media.origin !== new URL(source.baseUrl).origin || media.username || media.password || !/^\/v1\/media\/[^/\\]+$/.test(decodeURIComponent(media.pathname))) {
+        throw new Error("Muse 返回的图片地址不属于原渠道的媒体接口。");
+    }
+    const { data: blob } = await axios.get<Blob>(withLocalProxy(media.href), { ...request, responseType: "blob" });
+    let mimeType = blob.type;
+    if (!mimeType || mimeType === "application/octet-stream") {
+        const suffix = media.pathname.toLowerCase().match(/\.(webp|png|jpe?g)$/)?.[1];
+        if (suffix) mimeType = `image/${suffix === "jpg" ? "jpeg" : suffix}`;
+    }
+    if (!blob.size || !mimeType.startsWith("image/")) throw new Error("Muse 媒体接口未返回图片。");
+    const file = new File([blob], "image", { type: mimeType });
+    try {
+        (await createImageBitmap(file)).close();
+    } catch {
+        throw new Error("Muse 返回的媒体无法解码为图片。");
+    }
+    const dataUrl = await readFileAsDataUrl(file);
+    return { status: "completed", image: { id: taskId, dataUrl } };
+}
+
+export async function waitForMuseImageTask(config: AiConfig, source: MuseImageTaskSource, taskId: string, options?: RequestOptions) {
+    for (;;) {
+        options?.signal?.throwIfAborted();
+        const state = await pollMuseImageTask(config, source, taskId, options);
+        if (state.status !== "pending") return state;
+        await sleep(2500, options?.signal);
+    }
 }
 
 export async function requestGeneration(config: AiConfig, prompt: string, options?: RequestOptions) {
