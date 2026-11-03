@@ -15,7 +15,7 @@ import { clampVideoSeconds } from "@/lib/media-size";
 import { formatBytes, formatDuration } from "@/lib/image-utils";
 import { deleteStoredMedia, resolveMediaUrl } from "@/services/file-storage";
 import { resolveImageUrl, ensureImagePreview, getImagePreviewRevision, previewUrlFor, subscribeImagePreviews, uploadImage } from "@/services/image-storage";
-import { createVideoGenerationTask, pollVideoGenerationTask, storeGeneratedVideo, type VideoGenerationTask } from "@/services/api/video";
+import { createVideoGenerationTask, isMuseVideoTask, isVideoTaskFailed, storeGeneratedVideo, waitForVideoGenerationTask, type VideoGenerationTask } from "@/services/api/video";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
 import { boolConfig, modelOptionLabel, useConfigStore, useEffectiveConfig, type AiConfig } from "@/stores/use-config-store";
@@ -36,7 +36,7 @@ type GeneratedVideo = {
 
 type GenerationResult = {
     id: string;
-    status: "pending" | "success" | "failed";
+    status: "pending" | "success" | "failed" | "interrupted";
     video?: GeneratedVideo;
     error?: string;
 };
@@ -54,7 +54,8 @@ type GenerationLog = {
     size: string;
     resolution: string;
     seconds: string;
-    status: "pending" | "success" | "failed";
+    status: GenerationResult["status"];
+    upstreamFailed?: boolean;
     task?: VideoGenerationTask;
     video?: GeneratedVideo;
     error?: string;
@@ -73,7 +74,7 @@ export default function VideoPage() {
     useSyncExternalStore(subscribeImagePreviews, getImagePreviewRevision);
     const fileInputRef = useRef<HTMLInputElement>(null);
     const dragDepthRef = useRef(0);
-    const activeLogIdsRef = useRef<Set<string>>(new Set());
+    const activeQueries = useRef(new Map<string, AbortController>());
     const config = useConfigStore((state) => state.config);
     const effectiveConfig = useEffectiveConfig();
     const updateConfig = useConfigStore((state) => state.updateConfig);
@@ -112,7 +113,18 @@ export default function VideoPage() {
     }, [running, startedAt]);
 
     useEffect(() => {
-        void refreshLogs();
+        let mounted = true;
+        void readStoredLogs().then((items) => {
+            if (!mounted) return;
+            setLogs(items);
+            for (const log of items) {
+                if (log.status === "pending" && log.task) void pollGenerationLog(log);
+            }
+        });
+        return () => {
+            mounted = false;
+            for (const controller of activeQueries.current.values()) controller.abort();
+        };
     }, []);
 
     const addReferences = async (files?: FileList | null) => {
@@ -186,7 +198,8 @@ export default function VideoPage() {
         try {
             const task = await createVideoGenerationTask(snapshot.config, snapshot.text, snapshot.references);
             const log = buildLog({ prompt: snapshot.text, model, config: snapshot.config, references: snapshot.references, durationMs: 0, status: "pending", task });
-            await saveLog(log, false);
+            await saveLog(log);
+            setResults([{ id: log.id, status: "pending" }]);
             void pollGenerationLog(log, snapshot.config, agentTaskId);
         } catch (error) {
             const errorMessage = error instanceof Error ? error.message : t("workbench.generationFailed");
@@ -234,10 +247,6 @@ export default function VideoPage() {
         return { text, config: buildVideoConfig(effectiveConfig, model), references: [...references] };
     };
 
-    const retryResult = () => {
-        void generate();
-    };
-
     const downloadVideo = (video: GeneratedVideo) => {
         saveAs(video.url, "video.mp4");
     };
@@ -276,6 +285,7 @@ export default function VideoPage() {
     };
 
     const deleteSelectedLogs = () => {
+        for (const id of selectedLogIds) activeQueries.current.get(id)?.abort();
         const mediaKeys = logs
             .filter((log) => selectedLogIds.includes(log.id))
             .map((log) => log.video?.storageKey)
@@ -289,65 +299,66 @@ export default function VideoPage() {
         setDeleteConfirmOpen(false);
     };
 
-    const saveLog = async (log: GenerationLog, resumePending = true) => {
+    const saveLog = async (log: GenerationLog) => {
         await logStore.setItem(log.id, serializeLog(log));
-        await refreshLogs(resumePending);
+        await refreshLogs();
     };
 
-    const refreshLogs = async (resumePending = true) => {
-        const nextLogs = await readStoredLogs();
-        setLogs(nextLogs);
-        if (resumePending) resumePendingLogs(nextLogs);
-        return nextLogs;
-    };
-
-    const resumePendingLogs = (items: GenerationLog[]) => {
-        for (const log of items) {
-            if (log.status === "pending" && log.task) void pollGenerationLog(log);
-        }
+    const refreshLogs = async () => {
+        setLogs(await readStoredLogs());
     };
 
     const pollGenerationLog = async (log: GenerationLog, configOverride?: AiConfig, agentTaskId?: string) => {
-        if (!log.task || activeLogIdsRef.current.has(log.id)) return;
-        activeLogIdsRef.current.add(log.id);
+        const task = log.task;
+        if (!task || activeQueries.current.has(log.id)) return;
+        const controller = new AbortController();
+        activeQueries.current.set(log.id, controller);
         setRunning(true);
         setStartedAt((value) => value || performance.now());
-        setResults((value) => (value.length ? value : [{ id: log.id, status: "pending" }]));
-        const taskConfig = buildVideoConfig({ ...effectiveConfig, ...log.config }, log.task.model || log.model);
-        try {
-            for (let attempt = 0; attempt < 120; attempt += 1) {
-                const state = await pollVideoGenerationTask(configOverride || taskConfig, log.task);
-                if (state.status === "completed") {
-                    const stored = await storeGeneratedVideo(state.result);
-                    const nextVideo: GeneratedVideo = {
-                        id: nanoid(),
-                        url: stored.url,
-                        storageKey: stored.storageKey,
-                        durationMs: Date.now() - log.createdAt,
-                        width: stored.width || 1280,
-                        height: stored.height || 720,
-                        bytes: stored.bytes,
-                        mimeType: stored.mimeType,
-                    };
-                    setResults([{ id: nextVideo.id, status: "success", video: nextVideo }]);
-                    if (agentTaskId) updateAgentTask(agentTaskId, { status: "succeeded", successCount: 1, failCount: 0, error: undefined });
-                    await saveLog({ ...log, status: "success", durationMs: nextVideo.durationMs, video: nextVideo, error: undefined });
-                    message.success(t("videoWorkbench.generated"));
-                    return;
-                }
-                if (state.status === "failed") throw new Error(state.error);
-                if (attempt === 119) throw new Error(t("videoWorkbench.timeout"));
-                await delay(2500);
+        setResults((value) => (!value.length || value[0].id === log.id ? [{ id: log.id, status: "pending" }] : value));
+        const taskConfig = configOverride || buildVideoConfig({ ...effectiveConfig, ...log.config }, task.model);
+        const display = (item: GenerationResult) => setResults((value) => value[0]?.id === log.id ? [item] : value);
+        const query = async () => {
+            const latest = await logStore.getItem<GenerationLog>(log.id);
+            if (!latest || controller.signal.aborted) return;
+            if (logStatus(latest) !== log.status || latest.durationMs !== log.durationMs) {
+                const saved = await normalizeLog(latest);
+                display({ id: log.id, status: saved.status, video: saved.video, error: saved.error });
+                await refreshLogs();
+                return;
             }
+            try {
+                if (log.status === "interrupted") await saveLog({ ...log, status: "pending", error: undefined });
+                const result = await waitForVideoGenerationTask(taskConfig, task, { signal: controller.signal });
+                const stored = await storeGeneratedVideo(result);
+                if (controller.signal.aborted || !(await logStore.getItem(log.id))) return;
+                const video: GeneratedVideo = {
+                    id: nanoid(), url: stored.url, storageKey: stored.storageKey, durationMs: Date.now() - log.createdAt,
+                    width: stored.width || 1280, height: stored.height || 720, bytes: stored.bytes, mimeType: stored.mimeType,
+                };
+                await saveLog({ ...log, status: "success", durationMs: video.durationMs, video, error: undefined });
+                display({ id: log.id, status: "success", video });
+                if (agentTaskId) updateAgentTask(agentTaskId, { status: "succeeded", successCount: 1, failCount: 0, error: undefined });
+                message.success(t("videoWorkbench.generated"));
+            } catch (error) {
+                if (controller.signal.aborted || !(await logStore.getItem(log.id))) return;
+                const upstreamFailed = isVideoTaskFailed(error);
+                const status = isMuseVideoTask(task) && !upstreamFailed ? "interrupted" : "failed";
+                const errorMessage = error instanceof Error ? error.message : t("workbench.generationFailed");
+                await saveLog({ ...log, status, upstreamFailed, durationMs: Date.now() - log.createdAt, error: errorMessage });
+                display({ id: log.id, status, error: errorMessage });
+                if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", successCount: 0, failCount: 1, error: errorMessage });
+                message.error(errorMessage);
+            }
+        };
+        try {
+            if (isMuseVideoTask(task) && navigator.locks) await navigator.locks.request(`video-workbench:${log.id}`, query);
+            else await query();
         } catch (error) {
-            const errorMessage = error instanceof Error ? error.message : t("workbench.generationFailed");
-            setResults([{ id: log.id, status: "failed", error: errorMessage }]);
-            if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", successCount: 0, failCount: 1, error: errorMessage });
-            await saveLog({ ...log, status: "failed", durationMs: Date.now() - log.createdAt, error: errorMessage });
-            message.error(errorMessage);
+            if (!controller.signal.aborted) message.error(error instanceof Error ? error.message : t("workbench.generationFailed"));
         } finally {
-            activeLogIdsRef.current.delete(log.id);
-            if (!activeLogIdsRef.current.size) {
+            activeQueries.current.delete(log.id);
+            if (!activeQueries.current.size) {
                 setRunning(false);
                 setStartedAt(0);
             }
@@ -366,7 +377,7 @@ export default function VideoPage() {
         if (log.config.videoGenerateAudio) updateConfig("videoGenerateAudio", log.config.videoGenerateAudio);
         if (log.config.videoWatermark) updateConfig("videoWatermark", log.config.videoWatermark);
         if (log.config.videoMode) updateConfig("videoMode", log.config.videoMode);
-        setResults(log.status === "pending" ? [{ id: log.id, status: "pending" }] : log.video ? [{ id: log.video.id, status: "success", video: log.video }] : [{ id: log.id, status: "failed", error: log.error || t("workbench.generationFailed") }]);
+        setResults([{ id: log.id, status: log.status, video: log.video, error: log.error }]);
     };
 
     return (
@@ -470,7 +481,16 @@ export default function VideoPage() {
                         </div>
                         {results.length ? (
                             <div className="grid gap-4">
-                                {results.map((result) => (result.status === "success" && result.video ? <ResultVideoCard key={result.id} video={result.video} onDownload={downloadVideo} onSaveAsset={saveResultToAssets} /> : result.status === "failed" ? <FailedVideoCard key={result.id} error={result.error || t("workbench.generationFailed")} onRetry={retryResult} /> : <PendingVideoCard key={result.id} />))}
+                                {results.map((result) => {
+                                    if (result.video) return <ResultVideoCard key={result.id} video={result.video} onDownload={downloadVideo} onSaveAsset={saveResultToAssets} />;
+                                    if (result.status === "pending") return <PendingVideoCard key={result.id} />;
+                                    const interrupted = result.status === "interrupted";
+                                    return <FailedVideoCard key={result.id} error={result.error || t("workbench.generationFailed")} interrupted={interrupted} disabled={running} onRetry={() => {
+                                        if (!interrupted) return void generate();
+                                        const log = logs.find((item) => item.id === result.id);
+                                        if (log) void pollGenerationLog(log);
+                                    }} />;
+                                })}
                             </div>
                         ) : (
                             <div className="flex min-h-[320px] flex-col items-center justify-center rounded-lg border border-dashed border-stone-300 text-center dark:border-stone-700 lg:min-h-[560px]">
@@ -564,19 +584,19 @@ function PendingVideoCard() {
     );
 }
 
-function FailedVideoCard({ error, onRetry }: { error: string; onRetry: () => void }) {
+function FailedVideoCard({ error, interrupted, disabled, onRetry }: { error: string; interrupted: boolean; disabled: boolean; onRetry: () => void }) {
     const { t } = useTranslation();
     return (
         <div className="overflow-hidden rounded-lg border border-red-200 bg-red-50 dark:border-red-950 dark:bg-red-950/20">
             <div className="flex aspect-video flex-col items-center justify-center gap-3 p-5 text-center">
-                <div className="text-sm font-medium text-red-600 dark:text-red-300">{t("workbench.failed")}</div>
+                <div className="text-sm font-medium text-red-600 dark:text-red-300">{t(interrupted ? "videoWorkbench.interrupted" : "workbench.failed")}</div>
                 <Typography.Paragraph ellipsis={{ rows: 4 }} className="!mb-0 !text-xs !text-red-500 dark:!text-red-300">
                     {error}
                 </Typography.Paragraph>
             </div>
             <div className="flex justify-end border-t border-red-200 p-3 dark:border-red-950">
-                <Button size="small" danger onClick={onRetry}>
-                    {t("workbench.retry")}
+                <Button size="small" danger disabled={disabled} onClick={onRetry}>
+                    {t(interrupted ? "videoWorkbench.queryOriginal" : "workbench.retry")}
                 </Button>
             </div>
         </div>
@@ -647,7 +667,7 @@ function LogCard({ log, selected, active, onSelectedChange, onClick }: { log: Ge
                 </div>
                 <div className="grid justify-items-end gap-2">
                     <Tag className="m-0 flex h-6 items-center rounded-md px-1.5 text-xs leading-none" color={log.status === "success" ? "blue" : log.status === "pending" ? "processing" : "red"}>
-                        {t(`workbench.${log.status === "success" ? "success" : log.status === "pending" ? "generating" : "failed"}`)}
+                        {log.status === "interrupted" ? t("videoWorkbench.interrupted") : t(`workbench.${log.status === "success" ? "success" : log.status === "pending" ? "generating" : "failed"}`)}
                     </Tag>
                     <Tag className="m-0 flex h-6 items-center rounded-md px-1.5 text-xs leading-none" color="green">
                         {formatDuration(log.durationMs)}
@@ -669,6 +689,11 @@ async function readStoredLogs() {
     } catch {
         return [];
     }
+}
+
+function logStatus(log: Partial<GenerationLog>) {
+    if (log.status === "failed" && isMuseVideoTask(log.task) && !log.upstreamFailed) return "interrupted";
+    return log.status || "success";
 }
 
 async function normalizeLog(log: Partial<GenerationLog>): Promise<GenerationLog> {
@@ -693,7 +718,8 @@ async function normalizeLog(log: Partial<GenerationLog>): Promise<GenerationLog>
         size: log.size || config.size || "",
         resolution: normalizeResolution(log.resolution || config.vquality || ""),
         seconds: log.seconds || config.videoSeconds || "",
-        status: log.status || "success",
+        status: logStatus(log),
+        upstreamFailed: log.upstreamFailed,
         task: log.task,
         video,
         error: log.error,
@@ -795,8 +821,4 @@ function normalizeVideoSize(value: string) {
 
 function normalizeResolution(value: string) {
     return normalizeVideoResolutionValue(value);
-}
-
-function delay(ms: number) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
 }

@@ -15,12 +15,13 @@ import { modelOptionLabel, useConfigStore, useEffectiveConfig, type AiConfig } f
 import { useThemeStore } from "@/stores/use-theme-store";
 import { nanoid } from "nanoid";
 import { formatBytes, formatDuration } from "@/lib/image-utils";
-import { requestEdit, requestGeneration } from "@/services/api/image";
+import { getMuseImageTaskSource, requestEdit, requestGeneration, type MuseImageTaskSource } from "@/services/api/image";
 import { deleteStoredImages, ensureImagePreview, getImagePreviewRevision, previewUrlFor, resolveImageUrl, subscribeImagePreviews, uploadImage } from "@/services/image-storage";
 import { useAssetStore } from "@/stores/use-asset-store";
 import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
 import type { ReferenceImage } from "@/types/image";
 import i18n from "@/i18n";
+import { runMuseImageBatch } from "./muse-image-batch";
 
 type GeneratedImage = {
     id: string;
@@ -40,7 +41,7 @@ type GenerationResult = {
     error?: string;
 };
 
-type GenerationLog = {
+export type GenerationLog = {
     id: string;
     createdAt: number;
     title: string;
@@ -55,13 +56,22 @@ type GenerationLog = {
     imageCount: number;
     size: string;
     quality: string;
-    status: "success" | "failed";
+    status: "success" | "failed" | "pending";
+    muse?: { source: MuseImageTaskSource; background: string; systemPrompt: string; slots: MuseSlot[]; agentTaskId?: string };
     images: GeneratedImage[];
 };
 
 type GenerationLogConfig = Pick<AiConfig, "model" | "imageModel" | "quality" | "size" | "count">;
 
+export type MuseSlot = { key: string; taskId?: string; imageId?: string; failed?: boolean; error?: string };
 type UpdateAiConfig = <K extends keyof AiConfig>(key: K, value: AiConfig[K]) => void;
+
+function museResults(log: GenerationLog): GenerationResult[] {
+    return log.muse!.slots.map((slot) => {
+        const image = log.images.find((item) => item.id === slot.imageId);
+        return { id: slot.key, status: image ? "success" : slot.error ? "failed" : "pending", image, error: slot.error };
+    });
+}
 
 const LOG_STORE_KEY = "infinite-canvas:image_generation_logs";
 const RESULT_ACTION_BUTTON_CLASS = "min-w-0 px-1.5 [&_.ant-btn-icon]:shrink-0 [&>span:last-child]:min-w-0 [&>span:last-child]:truncate";
@@ -101,6 +111,8 @@ export default function ImagePage() {
     const processedCommandRef = useRef(0);
     const agentTaskIdRef = useRef<string | undefined>(undefined);
 
+    const activeBatches = useRef(new Map<string, AbortController>());
+    const shownBatch = useRef<string | null>(null);
     const model = effectiveConfig.imageModel || effectiveConfig.model;
     const canGenerate = Boolean(prompt.trim());
     const generationCount = Math.max(1, Math.min(10, Number(config.count) || 1));
@@ -112,7 +124,22 @@ export default function ImagePage() {
     }, [running, startedAt]);
 
     useEffect(() => {
-        void refreshLogs();
+        let mounted = true;
+        void readStoredLogs().then((items) => {
+            if (!mounted) return;
+            setLogs(items);
+            const pending = items.filter((item) => item.muse && item.status === "pending");
+            if (pending.length && !shownBatch.current) {
+                shownBatch.current = pending[0].id;
+                setPrompt(pending[0].prompt);
+                setReferences(pending[0].references);
+            }
+            for (const item of pending) void resumeMuse(item);
+        });
+        return () => {
+            mounted = false;
+            for (const controller of activeBatches.current.values()) controller.abort();
+        };
     }, []);
 
     const addReferences = async (files?: FileList | null) => {
@@ -177,6 +204,11 @@ export default function ImagePage() {
         const batchStartedAt = performance.now();
         setStartedAt(batchStartedAt);
 
+        if (getMuseImageTaskSource(snapshot.config)) {
+            await startMuse(snapshot, generationCount, agentTaskId);
+            return;
+        }
+        shownBatch.current = null;
         const tasks = Array.from({ length: generationCount }, (_, index) => runGenerationSlot(index, snapshot));
 
         const result = await Promise.allSettled(tasks);
@@ -266,6 +298,7 @@ export default function ImagePage() {
     };
 
     const createSession = () => {
+        shownBatch.current = null;
         setPrompt("");
         setReferences([]);
         setResults([]);
@@ -293,6 +326,7 @@ export default function ImagePage() {
     const refreshLogs = async () => setLogs(await readStoredLogs());
 
     const previewGenerationLog = async (log: GenerationLog) => {
+        shownBatch.current = log.id;
         setPreviewLog(log);
         setLogsOpen(false);
         setPrompt(log.prompt);
@@ -301,7 +335,7 @@ export default function ImagePage() {
         if (log.config.quality) updateConfig("quality", log.config.quality);
         if (log.config.size) updateConfig("size", log.config.size);
         if (log.config.count) updateConfig("count", log.config.count);
-        setResults(log.images.map((image) => ({ id: image.id, status: "success", image })));
+        setResults(log.muse ? museResults(log) : log.images.map((image) => ({ id: image.id, status: "success", image })));
     };
 
     const buildRequestSnapshot = () => {
@@ -334,11 +368,82 @@ export default function ImagePage() {
         }
     };
 
+    const startMuse = async (snapshot: { text: string; config: AiConfig; references: ReferenceImage[] }, count: number, agentTaskId?: string) => {
+        const source = getMuseImageTaskSource(snapshot.config)!;
+        const log = buildLog({ prompt: snapshot.text, model: snapshot.config.model, config: { ...snapshot.config, count: String(count) },
+            references: snapshot.references, durationMs: 0, successCount: 0, failCount: 0, status: "pending", images: [] });
+        log.muse = { source, background: snapshot.config.background, systemPrompt: snapshot.config.systemPrompt, agentTaskId,
+            slots: Array.from({ length: count }, () => ({ key: nanoid() })) };
+        try {
+            await logStore.setItem(log.id, serializeLog(log));
+            shownBatch.current = log.id;
+            setPreviewLog(log);
+            setResults(museResults(log));
+            await resumeMuse(log);
+        } catch (error) {
+            const reason = error instanceof Error ? error.message : t("workbench.generationFailed");
+            message.error(reason);
+            if (agentTaskId) updateAgentTask(agentTaskId, { status: "failed", error: reason });
+            setRunning(false);
+        }
+    };
+
+    const resumeMuse = async (initial: GenerationLog) => {
+        if (activeBatches.current.has(initial.id)) return;
+        const controller = new AbortController();
+        const { signal } = controller;
+        activeBatches.current.set(initial.id, controller);
+        setRunning(true);
+        setStartedAt(performance.now() - (Date.now() - initial.createdAt));
+        const display = (log: GenerationLog) => {
+            setLogs((items) => [log, ...items.filter((item) => item.id !== log.id)].sort((a,b) => b.createdAt - a.createdAt));
+            if (shownBatch.current === log.id) {
+                setPreviewLog(log);
+                setResults(museResults(log));
+            }
+        };
+        const run = async () => {
+            const stored = await logStore.getItem<GenerationLog>(initial.id);
+            if (!stored?.muse) return;
+            const log = await normalizeLog(stored);
+            display(log);
+            if (log.status !== "pending") return;
+            const batch = log.muse!;
+            await runMuseImageBatch(log, signal, async (record) => {
+                await logStore.setItem(log.id, serializeLog(record));
+                display(record);
+            });
+            const reason = batch.slots.find(slot => slot.error)?.error;
+            if (log.status === "pending") { if (reason) message.warning(reason); return; }
+            if (batch.agentTaskId) updateAgentTask(batch.agentTaskId, { status: log.successCount ? "succeeded" : "failed", successCount: log.successCount, failCount: log.failCount, error: reason });
+            if (log.successCount) message.success(t("imageWorkbench.generated"));
+            else message.error(reason || t("workbench.generationFailed"));
+        };
+        try {
+            if (navigator.locks) await navigator.locks.request("muse-image:" + initial.id, { signal }, run);
+            else await run();
+        } catch (error) {
+            if (!signal.aborted) message.error(error instanceof Error ? error.message : t("workbench.generationFailed"));
+        } finally {
+            activeBatches.current.delete(initial.id);
+            if (!activeBatches.current.size) setRunning(false);
+        }
+    };
+
     const retryResult = async (index: number) => {
+        const slot = previewLog?.muse?.slots[index];
+        if (previewLog && slot && !slot.failed && !slot.imageId) {
+            await resumeMuse(previewLog);
+            return;
+        }
         const snapshot = buildRequestSnapshot();
         if (!snapshot) return;
         setPreviewLog(null);
         setResults((value) => updateResultAt(value, index, { status: "pending", error: undefined, image: undefined }));
+        if (getMuseImageTaskSource(snapshot.config)) {
+            await startMuse(snapshot, 1);
+            return;
+        }
         const retryStartedAt = performance.now();
         try {
             const image = await runGenerationSlot(index, snapshot);
@@ -503,7 +608,7 @@ export default function ImagePage() {
                                     result.status === "success" && result.image ? (
                                         <ResultImageCard key={result.id} image={result.image} index={index} onEdit={addResultToReferences} onDownload={downloadImage} onSaveAsset={saveResultToAssets} />
                                     ) : result.status === "failed" ? (
-                                        <FailedImageCard key={result.id} error={result.error || t("workbench.generationFailed")} onRetry={() => retryResult(index)} />
+                                        <FailedImageCard key={result.id} error={result.error || t("workbench.generationFailed")} resume={Boolean(previewLog?.muse && !previewLog.muse.slots[index]?.failed)} onRetry={() => retryResult(index)} />
                                     ) : (
                                         <PendingImageCard key={result.id} />
                                     ),
@@ -638,19 +743,19 @@ function PendingImageCard() {
     );
 }
 
-function FailedImageCard({ error, onRetry }: { error: string; onRetry: () => void }) {
+function FailedImageCard({ error, resume, onRetry }: { error: string; resume?: boolean; onRetry: () => void }) {
     const { t } = useTranslation();
     return (
         <div className="overflow-hidden rounded-lg border border-red-200 bg-red-50 dark:border-red-950 dark:bg-red-950/20">
             <div className="flex aspect-square flex-col items-center justify-center gap-3 p-5 text-center">
-                <div className="text-sm font-medium text-red-600 dark:text-red-300">{t("workbench.failed")}</div>
+                <div className="text-sm font-medium text-red-600 dark:text-red-300">{t(resume ? "workbench.paused" : "workbench.failed")}</div>
                 <Typography.Paragraph ellipsis={{ rows: 4 }} className="!mb-0 !text-xs !text-red-500 dark:!text-red-300">
                     {error}
                 </Typography.Paragraph>
             </div>
             <div className="flex justify-end border-t border-red-200 p-3 dark:border-red-950">
                 <Button size="small" danger onClick={onRetry}>
-                    {t("workbench.retry")}
+                    {t(resume ? "workbench.resumeTask" : "workbench.retry")}
                 </Button>
             </div>
         </div>
@@ -679,8 +784,9 @@ function LogPanel({
     onPreviewLog: (log: GenerationLog) => void;
 }) {
     const { t } = useTranslation();
-    const allSelected = Boolean(logs.length) && selectedLogIds.length === logs.length;
-    const toggleAll = () => onSelectedLogIdsChange(allSelected ? [] : logs.map((log) => log.id));
+    const selectable = logs.filter(log => log.status !== "pending");
+    const allSelected = Boolean(selectable.length) && selectedLogIds.length === selectable.length;
+    const toggleAll = () => onSelectedLogIdsChange(allSelected ? [] : selectable.map(log => log.id));
 
     return (
         <>
@@ -731,7 +837,7 @@ function LogCard({ log, selected, active, onSelectedChange, onClick }: { log: Ge
         >
             <div className="grid grid-cols-[minmax(128px,1fr)_auto] gap-2">
                 <div className="grid min-w-0 grid-cols-[auto_minmax(0,1fr)] items-start gap-2">
-                    <Checkbox className="mt-0.5" checked={selected} onClick={(event) => event.stopPropagation()} onChange={(event) => onSelectedChange(event.target.checked)} />
+                    <Checkbox className="mt-0.5" disabled={log.status === "pending"} checked={selected} onClick={(event) => event.stopPropagation()} onChange={(event) => onSelectedChange(event.target.checked)} />
                     <div className="min-w-0">
                         <div className="truncate text-sm font-semibold leading-5">{log.title}</div>
                         {thumbnails.length ? (
@@ -745,6 +851,7 @@ function LogCard({ log, selected, active, onSelectedChange, onClick }: { log: Ge
                 </div>
                 <div className="grid justify-items-end gap-2">
                     <div className="flex gap-1">
+                        {log.status === "pending" && <Tag color="processing">{t(log.muse?.slots.some(slot => slot.error && !slot.failed) ? "workbench.paused" : "workbench.generating")}</Tag>}
                         <Tag className="m-0 flex h-6 items-center rounded-md px-1.5 text-xs leading-none" color="blue">
                             {t("workbench.successCount", { count: log.successCount ?? log.imageCount })}
                         </Tag>
@@ -813,6 +920,7 @@ async function normalizeLog(log: Partial<GenerationLog>): Promise<GenerationLog>
         size: log.size || config.size || "",
         quality: log.quality || config.quality || "",
         status: log.status || "success",
+        muse: log.muse,
         images,
     };
 }

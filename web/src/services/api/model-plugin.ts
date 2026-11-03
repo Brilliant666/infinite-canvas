@@ -73,21 +73,21 @@ function createPluginRequest(config: AiConfig, options?: RequestOptions) {
     };
 }
 
-function sleep(ms: number, signal?: AbortSignal) {
+export function sleep(ms: number, signal?: AbortSignal) {
     return new Promise<void>((resolve, reject) => {
         if (signal?.aborted) {
             reject(new DOMException("Aborted", "AbortError"));
             return;
         }
-        const timer = setTimeout(resolve, ms);
-        signal?.addEventListener(
-            "abort",
-            () => {
-                clearTimeout(timer);
-                reject(new DOMException("Aborted", "AbortError"));
-            },
-            { once: true },
-        );
+        const timer = setTimeout(() => {
+            signal?.removeEventListener("abort", abort);
+            resolve();
+        }, ms);
+        function abort() {
+            clearTimeout(timer);
+            reject(new DOMException("Aborted", "AbortError"));
+        }
+        signal?.addEventListener("abort", abort, { once: true });
     });
 }
 

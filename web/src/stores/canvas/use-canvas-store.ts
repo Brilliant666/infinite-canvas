@@ -45,6 +45,20 @@ type PersistedCanvasState = Pick<CanvasStore, "projects" | "deletedProjects">;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 let queuedPersistState: PersistedCanvasState | null = null;
 
+let queuedValue: StorageValue<CanvasStore> | undefined;
+let writing = Promise.resolve();
+
+export function flushCanvasStorage() {
+    if (saveTimer) clearTimeout(saveTimer);
+    saveTimer = null;
+    if (queuedValue) {
+        const data = JSON.stringify(queuedValue);
+        queuedValue = undefined;
+        writing = writing.catch(() => undefined).then(async () => { await localForageStorage.setItem(CANVAS_STORE_KEY, data); });
+    }
+    return writing;
+}
+
 const canvasStorage: PersistStorage<CanvasStore> = {
     getItem: async (name) => {
         const value = await localForageStorage.getItem(name);
@@ -53,15 +67,13 @@ const canvasStorage: PersistStorage<CanvasStore> = {
         queuedPersistState = parsed.state as PersistedCanvasState;
         return parsed;
     },
-    setItem: (name, value) => {
+    setItem: (_name, value) => {
         const nextState = value.state as PersistedCanvasState;
         if (queuedPersistState && queuedPersistState.projects === nextState.projects && queuedPersistState.deletedProjects === nextState.deletedProjects) return;
         queuedPersistState = nextState;
         if (saveTimer) clearTimeout(saveTimer);
-        saveTimer = setTimeout(() => {
-            saveTimer = null;
-            void localForageStorage.setItem(name, JSON.stringify(value));
-        }, 400);
+        queuedValue = value;
+        saveTimer = setTimeout(() => { void flushCanvasStorage(); }, 400);
     },
     removeItem: (name) => localForageStorage.removeItem(name),
 };

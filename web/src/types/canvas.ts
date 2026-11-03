@@ -1,3 +1,19 @@
+import type { MuseImageTaskSource } from "@/services/api/image";
+import type { AiConfig } from "@/stores/use-config-store";
+import type { ReferenceImage } from "@/types/image";
+
+export type CanvasMuseImageTask = {
+    key: string;
+    source: MuseImageTaskSource;
+    config: Pick<AiConfig, "model" | "size" | "quality" | "background" | "systemPrompt">;
+    prompt: string;
+    references: ReferenceImage[];
+    originId: string;
+    slotId?: string;
+    taskId?: string;
+    paused?: boolean;
+};
+
 export type Position = {
     x: number;
     y: number;
@@ -81,6 +97,7 @@ export type CanvasNodeMetadata = {
     mimeType?: string;
     bytes?: number;
     durationMs?: number;
+    museImageTasks?: CanvasMuseImageTask[];
     videoTaskId?: string;
     videoTaskProvider?: "openai" | "gemini";
     groupId?: string;

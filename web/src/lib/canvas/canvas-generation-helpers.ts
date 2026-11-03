@@ -128,22 +128,31 @@ export function hasResumableVideoTask(node: CanvasNodeData) {
 }
 
 export function resetInterruptedGeneration(nodes: CanvasNodeData[]) {
-    return nodes.map((node) =>
-        node.metadata?.status === "loading"
-            ? hasResumableVideoTask(node)
-                ? node
-                : {
-                      ...node,
-                      metadata: {
-                          ...node.metadata,
-                          status: "error" as const,
-                          errorDetails: i18n.t("canvas.generation.interrupted"),
-                          images: node.metadata.images?.map((image) => (image.status === "loading" ? { ...image, status: "error" as const, errorDetails: i18n.t("canvas.generation.interrupted") } : image)),
-                          texts: node.metadata.texts?.map((text) => (text.status === "loading" ? { ...text, status: "error" as const, errorDetails: i18n.t("canvas.generation.interrupted") } : text)),
-                      },
-                  }
-            : node,
-    );
+    const museOrigins = new Set(nodes.flatMap((node) => node.metadata?.museImageTasks?.map((task) => task.originId) || []));
+    return nodes.map((node) => {
+        const meta = node.metadata;
+        if (meta?.museImageTasks?.length) {
+            const slots = new Set(meta.museImageTasks.map((task) => task.slotId));
+            return {
+                ...node,
+                metadata: {
+                    ...meta, status: "loading" as const, errorDetails: undefined,
+                    museImageTasks: meta.museImageTasks.map((task) => ({ ...task, paused: false })),
+                    images: meta.images?.map((image) => slots.has(image.id) ? { ...image, status: "loading" as const, errorDetails: undefined } : image),
+                },
+            };
+        }
+        if (meta?.status !== "loading" || hasResumableVideoTask(node) || museOrigins.has(node.id)) return node;
+        const interrupted = { status: "error" as const, errorDetails: i18n.t("canvas.generation.interrupted") };
+        return {
+            ...node,
+            metadata: {
+                ...meta, ...interrupted,
+                images: meta.images?.map((image) => image.status === "loading" ? { ...image, ...interrupted } : image),
+                texts: meta.texts?.map((text) => text.status === "loading" ? { ...text, ...interrupted } : text),
+            },
+        };
+    });
 }
 
 export function isGenerationCanceled(error: unknown) {
