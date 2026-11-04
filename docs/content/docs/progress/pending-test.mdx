@@ -7,6 +7,8 @@ description: Implemented changes that still need manual verification
 
 The current release needs manual verification in these areas:
 
+- 生图工作台失败和暂停卡片：默认显示四行摘要，可在固定尺寸卡片内展开、滚动查看全文并再次收起；展开前后卡片与操作栏位置保持稳定。复制始终包含接口返回的完整错误，保留换行。检查长文本、无空格长串及同批多卡片的独立展开状态。
+
 - Muse images: Image Studio recovered one live image into the original record after refresh both before and after saving the task ID. The replay returned the same task ID. A two-image canvas batch also recovered in a browser with a simulated Muse endpoint (two generated images, two submissions). Verify reference images, mixed batch outcomes and a changed provider configuration.
 - Muse video history: querying an existing interrupted task recovered the live MP4 and it remained playable after refresh. Verify that a confirmed upstream failure remains visible.
 

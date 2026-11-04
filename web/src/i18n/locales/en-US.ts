@@ -147,6 +147,8 @@ export default {
         generating: "Generating",
         paused: "Awaiting recovery",
         resumeTask: "Resume original task",
+        expandError: "Show full message",
+        collapseError: "Collapse",
         success: "Succeeded",
         failed: "Generation failed",
         retry: "Retry",
