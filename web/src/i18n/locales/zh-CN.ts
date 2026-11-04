@@ -147,6 +147,8 @@ export default {
         generating: "生成中",
         paused: "等待恢复",
         resumeTask: "继续原任务",
+        expandError: "展开全文",
+        collapseError: "收起",
         success: "成功",
         failed: "生成失败",
         retry: "重试",

@@ -1,5 +1,5 @@
 import { ArrowLeft, ArrowRight, BookOpen, CheckSquare, ClipboardPaste, Download, FolderPlus, History, ImagePlus, LoaderCircle, PenLine, Plus, SlidersHorizontal, Sparkles, Trash2, Upload } from "lucide-react";
-import { useEffect, useRef, useState, useSyncExternalStore } from "react";
+import { useEffect, useId, useRef, useState, useSyncExternalStore } from "react";
 import { App, Button, Checkbox, Drawer, Empty, Image, Input, Modal, Tag, Tooltip, Typography } from "antd";
 import localforage from "localforage";
 import { saveAs } from "file-saver";
@@ -22,6 +22,7 @@ import { useWorkbenchAgentStore } from "@/stores/use-workbench-agent-store";
 import type { ReferenceImage } from "@/types/image";
 import i18n from "@/i18n";
 import { runMuseImageBatch } from "./muse-image-batch";
+import { useCopyText } from "@/hooks/use-copy-text";
 
 type GeneratedImage = {
     id: string;
@@ -745,15 +746,23 @@ function PendingImageCard() {
 
 function FailedImageCard({ error, resume, onRetry }: { error: string; resume?: boolean; onRetry: () => void }) {
     const { t } = useTranslation();
+    const [expanded, setExpanded] = useState(false);
+    const errorId = useId();
+    const copyText = useCopyText();
     return (
         <div className="overflow-hidden rounded-lg border border-red-200 bg-red-50 dark:border-red-950 dark:bg-red-950/20">
-            <div className="flex aspect-square flex-col items-center justify-center gap-3 p-5 text-center">
+            <div className={`flex flex-col items-center justify-center gap-3 p-5 text-center ${expanded ? "min-h-64" : "aspect-square"}`}>
                 <div className="text-sm font-medium text-red-600 dark:text-red-300">{t(resume ? "workbench.paused" : "workbench.failed")}</div>
-                <Typography.Paragraph ellipsis={{ rows: 4 }} className="!mb-0 !text-xs !text-red-500 dark:!text-red-300">
+                <p id={errorId} className={`m-0 w-full whitespace-pre-wrap text-left text-xs text-red-500 [overflow-wrap:anywhere] dark:text-red-300 ${expanded ? "" : "line-clamp-4"}`}>
                     {error}
-                </Typography.Paragraph>
+                </p>
             </div>
-            <div className="flex justify-end border-t border-red-200 p-3 dark:border-red-950">
+            <div className="flex flex-wrap items-center gap-2 border-t border-red-200 p-3 dark:border-red-950">
+                <Button size="small" type="text" aria-expanded={expanded} aria-controls={errorId} onClick={() => setExpanded((value) => !value)}>
+                    {t(expanded ? "workbench.collapseError" : "workbench.expandError")}
+                </Button>
+                <Button size="small" type="text" onClick={() => copyText(error)}>{t("common.copy")}</Button>
+                <span className="flex-1" />
                 <Button size="small" danger onClick={onRetry}>
                     {t(resume ? "workbench.resumeTask" : "workbench.retry")}
                 </Button>
