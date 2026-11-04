@@ -751,11 +751,13 @@ function FailedImageCard({ error, resume, onRetry }: { error: string; resume?: b
     const copyText = useCopyText();
     return (
         <div className="overflow-hidden rounded-lg border border-red-200 bg-red-50 dark:border-red-950 dark:bg-red-950/20">
-            <div className={`flex flex-col items-center justify-center gap-3 p-5 text-center ${expanded ? "min-h-64" : "aspect-square"}`}>
-                <div className="text-sm font-medium text-red-600 dark:text-red-300">{t(resume ? "workbench.paused" : "workbench.failed")}</div>
-                <p id={errorId} className={`m-0 w-full whitespace-pre-wrap text-left text-xs text-red-500 [overflow-wrap:anywhere] dark:text-red-300 ${expanded ? "" : "line-clamp-4"}`}>
-                    {error}
-                </p>
+            <div className="relative aspect-square">
+                <div className="absolute inset-0 flex min-h-0 flex-col items-center justify-center gap-3 p-5 text-center">
+                    <div className="shrink-0 text-sm font-medium text-red-600 dark:text-red-300">{t(resume ? "workbench.paused" : "workbench.failed")}</div>
+                    <p id={errorId} tabIndex={expanded ? 0 : undefined} className={`m-0 min-h-0 w-full whitespace-pre-wrap text-left text-xs text-red-500 [overflow-wrap:anywhere] dark:text-red-300 ${expanded ? "overflow-y-auto [scrollbar-gutter:stable]" : "line-clamp-4"}`}>
+                        {error}
+                    </p>
+                </div>
             </div>
             <div className="flex flex-wrap items-center gap-2 border-t border-red-200 p-3 dark:border-red-950">
                 <Button size="small" type="text" aria-expanded={expanded} aria-controls={errorId} onClick={() => setExpanded((value) => !value)}>
